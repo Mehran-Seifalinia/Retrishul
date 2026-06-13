@@ -1,5 +1,7 @@
 # ReTrishul
 
+> **Note:** ReTrishul is a **developed and improved version** of the original [Trishul](https://github.com/gauravnarwani97/Trishul) Burp Suite extension. It builds upon the core idea while adding new capabilities and enhancements.
+
 [![Burp Suite](https://img.shields.io/badge/Burp%20Suite-Extension-orange)](https://portswigger.net/burp)
 [![Jython](https://img.shields.io/badge/Jython-2.7-blue)](https://www.jython.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
