@@ -4,8 +4,9 @@ from datetime import datetime
 from thread import start_new_thread
 from threading import Lock
 from json import loads, dumps
+from threading import Thread
 
-from javax.swing import JTable, JPanel, JToggleButton, JCheckBox, JMenuItem, JTree, JSplitPane, JEditorPane, JScrollPane, JTabbedPane, SwingUtilities
+from javax.swing import JTable, JPanel, JToggleButton, JCheckBox, JMenuItem, JTree, JSplitPane, JEditorPane, JScrollPane, JTabbedPane, SwingUtilities, JLabel, JSpinner, SpinnerNumberModel
 from javax.swing.table import TableRowSorter, AbstractTableModel
 from javax.swing.tree import DefaultMutableTreeNode, TreePath
 from javax.swing.text.html import HTMLEditorKit
@@ -13,6 +14,7 @@ from java.net import URLEncoder
 from java.awt import Color, Dimension
 from java.awt.event import MouseAdapter, AdjustmentListener, ActionListener
 from java.util import LinkedList, ArrayList
+from java.util.concurrent import TimeUnit
 from java.lang import Runnable, Integer, String, Math
 
 # Initialize BurpExtender API to use Extender features
@@ -24,6 +26,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self._log = ArrayList()
 		self._lock = Lock()		
 		self.intercept = 0
+
+		# SQLi settings to reduce timeout false positives
+		self.sql_timeout_seconds = 10
+		self.sql_time_threshold = 4.0
+		self.sql_max_reasonable_delay = 15.0
+
 		self.FOUND = "Found"
 		self.CHECK = "Possible! Check Manually"
 		self.NOT_FOUND = "Not Found"
@@ -85,6 +93,23 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self.ssticheck.setSelected(True)
 		self.ssticheck.setBounds(40, 170, 200, 30)
 		self.configtab.add(self.ssticheck)
+
+		# SQLi timeout and threshold configuration
+		self.sqlTimeoutLabel = JLabel("SQLi Request Timeout (sec):")
+		self.sqlTimeoutLabel.setBounds(40, 205, 180, 25)
+		self.configtab.add(self.sqlTimeoutLabel)
+
+		self.sqlTimeoutSpinner = JSpinner(SpinnerNumberModel(10, 5, 30, 1))
+		self.sqlTimeoutSpinner.setBounds(220, 205, 70, 25)
+		self.configtab.add(self.sqlTimeoutSpinner)
+
+		self.sqlThresholdLabel = JLabel("Time-based Threshold (sec):")
+		self.sqlThresholdLabel.setBounds(40, 235, 180, 25)
+		self.configtab.add(self.sqlThresholdLabel)
+
+		self.sqlThresholdSpinner = JSpinner(SpinnerNumberModel(4, 3, 10, 1))
+		self.sqlThresholdSpinner.setBounds(220, 235, 70, 25)
+		self.configtab.add(self.sqlThresholdSpinner)
 
 	# Turn Intercept from Proxy on or off
 	def startOrStop(self, event=None):
@@ -266,7 +291,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 							break
 					if len(param_new) != 0 or is_yaml:
 						if self._callbacks.isInScope(requeststr):
-							start_new_thread(self.sendRequestToReTrishul, (messageInf,))
+							# Start the scanning in a separate thread
+							t = Thread(target=self.sendRequestToReTrishul, args=(messageInf,))
+							t.daemon = True  # So the thread dies when Burp exits
+							t.start()
 		return
 
 	def _buildUpdatedRequest(self, request, headers, param_name, param_value, param_type, new_value):
@@ -528,36 +556,56 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		return (status, score, attack, description)
 		
 	def _test_sqli(self, request, headers, param_name, param_value, param_type, original_message, baseline_time):
+		"""Improved SQLi test with timeout false positive reduction"""
+		# Read current values from config spinners
+		timeout_sec = int(self.sqlTimeoutSpinner.getValue())
+		threshold = float(self.sqlThresholdSpinner.getValue())
+		
 		value = "' and (select * from (select(sleep(5)))a)--"
 		updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, value)
+		
 		if updated_request is None:
 			return (self.NOT_FOUND, 0, None, "")
+
 		orig = datetime.today()
 		attack = self.makeRequest(original_message, updated_request)
+		
 		if attack is None:
 			return (self.NOT_FOUND, 0, None, "")
+			
 		new_time = datetime.today()
 		response_str = self._helpers.bytesToString(attack.getResponse())
 		diff = (new_time - orig).total_seconds()
+		
 		score = 0
-		if (diff - baseline_time) > 3:
-			score = 4
 		found_text = ""
+		
+		# Error-based detection
 		for error in self.error_array:
 			if error in response_str:
-				found_text += error
-				score += 1
-		if score > 2:
+				found_text += error + " "
+				score += 2
+
+		# Time-based detection with FP filter
+		is_timeout = diff >= self.sql_max_reasonable_delay
+		if not is_timeout and diff > threshold:
+			score += 3
+
+		if score > 3:
 			status = self.FOUND
 		elif score > 1:
 			status = self.CHECK
 		else:
 			status = self.NOT_FOUND
+
 		desc = ""
-		if found_text != '':
-			desc = "The payload <b>" + self._helpers.urlDecode(value) + "</b> was passed in the request for parameter <b>" + self._helpers.urlDecode(param_name) + "</b>. Some errors were generated in the response which confirms that there is an Error based SQLi. Please check the request and response for this parameter"
-		elif (diff - baseline_time) > 3:
-			desc = "The payload <b>" + self._helpers.urlDecode(value) + "</b> was passed in the request for parameter <b>" + self._helpers.urlDecode(param_name) + "</b>. The response was in a delay of <b>" + str(diff) + "</b> seconds as compared to original <b>" + str(baseline_time) + "</b> seconds. This indicates that there is a time based SQLi. Please check the request and response for this parameter"
+		if found_text:
+			desc = "The payload <b>" + self._helpers.urlDecode(value) + "</b> was passed for parameter <b>" + self._helpers.urlDecode(param_name) + "</b>.<br>Database errors detected: " + found_text
+		elif not is_timeout and diff > threshold:
+			desc = "The payload <b>" + self._helpers.urlDecode(value) + "</b> was passed for parameter <b>" + self._helpers.urlDecode(param_name) + "</b>.<br>Response delayed <b>" + str(round(diff, 2)) + "</b>s (baseline: " + str(round(baseline_time, 2)) + "s). Likely time-based SQLi."
+		elif is_timeout:
+			desc = "High delay detected but likely caused by timeout/WAF. Not counted as vulnerability."
+
 		return (status, score, attack, desc)
 
 	def _test_ssti(self, request, headers, param_name, param_value, param_type, original_message):
@@ -917,7 +965,10 @@ class handleMenuItems(ActionListener):
 		self._messageInfo = messageInfo
 
 	def actionPerformed(self, e):
-		start_new_thread(self._extender.sendRequestToReTrishul, (self._messageInfo,))
+		# Start the scanning in a separate thread when user sends request manually
+		t = Thread(target=self._extender.sendRequestToReTrishul, args=(self._messageInfo,))
+		t.daemon = True
+		t.start()
 
 # Function to insert request details into the table
 class UpdateTableEDT(Runnable):
