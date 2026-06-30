@@ -3,12 +3,13 @@ from array import array
 from datetime import datetime
 from thread import start_new_thread
 from threading import Lock
+from json import loads, dumps
 
 from javax.swing import JTable, JPanel, JToggleButton, JCheckBox, JMenuItem, JTree, JSplitPane, JEditorPane, JScrollPane, JTabbedPane, SwingUtilities
 from javax.swing.table import TableRowSorter, AbstractTableModel
 from javax.swing.tree import DefaultMutableTreeNode, TreePath
 from javax.swing.text.html import HTMLEditorKit
-from java.net import URL, URLEncoder
+from java.net import URLEncoder
 from java.awt import Color, Dimension
 from java.awt.event import MouseAdapter, AdjustmentListener, ActionListener
 from java.util import LinkedList, ArrayList
@@ -112,10 +113,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self._texteditor = self._callbacks.createTextEditor()
 		self._texteditor.setEditable(False)
 
+	def _adjustDivider(self):
+		self._splitpane.setDividerLocation(0.8)
+
 	# Initialize ReTrishul Tabs
 	def tabsInit(self):
 		self.logTable = Table(self)
 		tableWidth = self.logTable.getPreferredSize().width
+		SwingUtilities.invokeLater(DividerRunnable(self))
 		self.logTable.getColumn("#").setPreferredWidth(Math.round(tableWidth / 50 * 0.1))
 		self.logTable.getColumn("Method").setPreferredWidth(Math.round(tableWidth / 50 * 3))
 		self.logTable.getColumn("URL").setPreferredWidth(Math.round(tableWidth / 50 * 40))
@@ -139,7 +144,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self.tabs.addTab("Highlighted Response", self._texteditor.getComponent())
 		self._bottomsplit.setRightComponent(self.tabs)
 		self._splitpane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
-		self._splitpane.setDividerLocation(0.6)
 		self._splitpane.setResizeWeight(1)
 		self.scrollPane = JScrollPane(self.logTable)
 		self._splitpane.setLeftComponent(self.scrollPane)
@@ -253,37 +257,74 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 					requeststr = requestInfo.getUrl()
 					parameters = requestInfo.getParameters()
 					param_new = [p for p in parameters if p.getType() != 2]
-					if len(param_new) != 0:
+					# Check if it's a YAML request to trigger scan even without standard parameters
+					is_yaml = False
+					headers_list = requestInfo.getHeaders()
+					for h in headers_list:
+						if 'Content-Type' in h and ('yaml' in h.lower() or 'yml' in h.lower()):
+							is_yaml = True
+							break
+					if len(param_new) != 0 or is_yaml:
 						if self._callbacks.isInScope(requeststr):
 							start_new_thread(self.sendRequestToReTrishul, (messageInf,))
 		return
 
 	def _buildUpdatedRequest(self, request, headers, param_name, param_value, param_type, new_value):
-		"""
-		Builds a new HTTP request with the specified parameter updated to new_value.
-		Handles GET, POST, and JSON parameters (type 0,1,6).
-		Returns bytearray request or None if failed.
-		"""
-		if param_type in (0, 1):  # GET or POST
-			new_param = self._helpers.buildParameter(param_name, new_value, param_type)
+		if param_type in (0, 1):
+			encoded_value = URLEncoder.encode(new_value, "UTF-8")
+			new_param = self._helpers.buildParameter(param_name, encoded_value, param_type)
 			return self._helpers.updateParameter(request, new_param)
 		elif param_type == 6:  # JSON
 			request_str = self._helpers.bytesToString(request)
-			import re
-			json_match = re.search(r"\s([{\[].*?[}\]])$", request_str)
-			if json_match is None:
-				return None
-			jsonreq = json_match.group(1)
 			try:
-				after_name = jsonreq.split(param_name + '":', 1)[1]
-			except IndexError:
+				body_start = request_str.find('\r\n\r\n') + 4
+				body = request_str[body_start:]
+				data = loads(body)
+				def update(d, key, val):
+					if isinstance(d, dict):
+						for k, v in d.items():
+							if k == key:
+								d[k] = val
+								return True
+							elif isinstance(v, (dict, list)):
+								if update(v, key, val):
+									return True
+					elif isinstance(d, list):
+						for item in d:
+							if isinstance(item, (dict, list)):
+								if update(item, key, val):
+									return True
+					return False
+				if update(data, param_name, new_value):
+					new_body = dumps(data)
+					new_headers = [h for h in headers if not h.lower().startswith('content-length')]
+					new_headers.append('Content-Length: ' + str(len(new_body)))
+					return self._helpers.buildHttpMessage(new_headers, new_body)
+				else:
+					return None
+			except Exception as e:
+				print("[ReTrishul] JSON update error:", e)
 				return None
-			if after_name.startswith('"'):
-				new_jsonreq = jsonreq.replace(param_name + '":"' + param_value, param_name + '":"' + new_value)
+		elif param_type == 7:  # YAML (simple line replacement)
+			request_str = self._helpers.bytesToString(request)
+			lines = request_str.splitlines()
+			new_lines = []
+			found = False
+			for line in lines:
+				if line.strip().startswith(param_name + ':'):
+					new_lines.append(param_name + ': ' + new_value)
+					found = True
+				else:
+					new_lines.append(line)
+			if found:
+				new_body = '\n'.join(new_lines)
+				new_headers = [h for h in headers if not h.lower().startswith('content-length')]
+				new_headers.append('Content-Length: ' + str(len(new_body)))
+				return self._helpers.buildHttpMessage(new_headers, new_body)
 			else:
-				new_jsonreq = jsonreq.replace(param_name + '":' + param_value, param_name + '":"' + new_value + '"')
-			return self._helpers.buildHttpMessage(headers, new_jsonreq)
-		return None
+				return None
+		else:
+			return None
 
 	# Main processing of ReTrishul
 	def sendRequestToReTrishul(self,messageInfo):
@@ -327,6 +368,27 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		sqli_description = []
 		xss_description = []
 		
+		# Add YAML parameters if Content-Type indicates YAML
+		headers_list = requestInfo.getHeaders()
+		for h in headers_list:
+			if 'Content-Type' in h and ('yaml' in h.lower() or 'yml' in h.lower()):
+				yaml_params = self._extract_yaml_parameters(request)
+				# Create fake parameter objects
+				class FakeParam:
+					def __init__(self, n, v, t):
+						self._name = n
+						self._value = v
+						self._type = t
+					def getName(self):
+						return self._name
+					def getValue(self):
+						return self._value
+					def getType(self):
+						return self._type
+				for name, value, typ in yaml_params:
+					param_new.append(FakeParam(name, value, typ))
+				break
+
 		# NEW: refactored loop using helper methods
 		for param in param_new:
 			name = param.getName()
@@ -435,8 +497,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			payload_all += rand_str + payload
 		for payload in json_payload_array:
 			json_payload += rand_str + payload
-		payload_all = URLEncoder.encode(payload_all, "UTF-8")
-		json_payload = URLEncoder.encode(json_payload, "UTF-8")
 
 		if param_type in (0, 1):
 			updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, payload_all)
@@ -576,6 +636,27 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self._log.add(LogEntry(self._callbacks.saveBuffersToTempFiles(messageInfo), requestInfo.getUrl(),method,final_XSS,final_SQLi,final_SSTI,req_time, parameters,resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp, xss_description, sqli_description, ssti_description)) # same requests not include again.
 		SwingUtilities.invokeLater(UpdateTableEDT(self,"insert",row,row))
 		self._lock.release()
+
+	def _extract_yaml_parameters(self, request):
+		request_str = self._helpers.bytesToString(request)
+		body_start = request_str.find('\r\n\r\n') + 4
+		body = request_str[body_start:]
+		params = []
+		for line in body.splitlines():
+			if ':' in line and not line.strip().startswith('#'):
+				key, value = line.split(':', 1)
+				key = key.strip()
+				value = value.strip()
+				if key and value:
+					params.append((key, value, 7))  # type 7 for YAML
+		return params
+
+class DividerRunnable(Runnable):
+    def __init__(self, extender):
+        self.extender = extender
+
+    def run(self):
+        self.extender._adjustDivider()
 
 # Extend JTable to handle cell selection
 class Table(JTable):
