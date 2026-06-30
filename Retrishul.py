@@ -1,7 +1,6 @@
 from burp import ITab, IBurpExtender, IHttpListener, IContextMenuFactory, IMessageEditorController, IHttpRequestResponseWithMarkers, ITextEditor
 from array import array
 from datetime import datetime
-from thread import start_new_thread
 from threading import Lock
 from json import loads, dumps
 from threading import Thread
@@ -14,7 +13,6 @@ from java.net import URLEncoder
 from java.awt import Color, Dimension
 from java.awt.event import MouseAdapter, AdjustmentListener, ActionListener
 from java.util import LinkedList, ArrayList
-from java.util.concurrent import TimeUnit
 from java.lang import Runnable, Integer, String, Math
 
 # Initialize BurpExtender API to use Extender features
@@ -26,6 +24,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self._log = ArrayList()
 		self._lock = Lock()		
 		self.intercept = 0
+		self.max_workers = 5
 
 		# SQLi settings to reduce timeout false positives
 		self.sql_timeout_seconds = 10
@@ -417,59 +416,29 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 					param_new.append(FakeParam(name, value, typ))
 				break
 
-		# NEW: refactored loop using helper methods
-		for param in param_new:
+		# Parallel parameter testing using threads (Jython compatible)
+		results = []
+		threads = []
+		param_results = [None] * len(param_new)
+
+		def test_param(index, param):
 			name = param.getName()
 			ptype = param.getType()
 			param_value = param.getValue()
-			xss_status = self.NOT_FOUND
-			sqli_status = self.NOT_FOUND
-			ssti_status = self.NOT_FOUND
-			xss_desc = ""
-			sqli_desc = ""
-			ssti_desc = ""
-			xss_attack = None
-			sqli_attack = None
-			ssti_attack = None
-			xss_score = 0
-			sqli_score = 0
-			ssti_score = 0
+			result = self._test_single_param(request, headers, name, param_value, ptype, Comp_req, xss_enabled, sqli_enabled, ssti_enabled, time_taken)
+			param_results[index] = (param, result)
 
-			if xss_enabled:
-				xss_status, xss_score, xss_attack, xss_desc = self._test_xss(request, headers, name, param_value, ptype, Comp_req)
-				resultxss.append(xss_status)
-				if xss_attack:
-					xssreqresp.append(xss_attack)
-					xss_description.append(xss_desc)
-				xssflag = self.checkBetterScore(xss_score, xssflag)
-			else:
-				resultxss.append("Disabled")
-				xssreqresp.append(None)
-				xss_description.append("")
+		for i, param in enumerate(param_new):
+			t = Thread(target=test_param, args=(i, param))
+			t.daemon = True
+			threads.append(t)
+			t.start()
 
-			if sqli_enabled:
-				sqli_status, sqli_score, sqli_attack, sqli_desc = self._test_sqli(request, headers, name, param_value, ptype, Comp_req, time_taken)
-				resultsqli.append(sqli_status)
-				if sqli_attack:
-					sqlireqresp.append(sqli_attack)
-					sqli_description.append(sqli_desc)
-				sqliflag = self.checkBetterScore(sqli_score, sqliflag)
-			else:
-				resultsqli.append("Disabled")
-				sqlireqresp.append(None)
-				sqli_description.append("")
+		# Wait for all threads
+		for t in threads:
+			t.join()
 
-			if ssti_enabled:
-				ssti_status, ssti_score, ssti_attack, ssti_desc = self._test_ssti(request, headers, name, param_value, ptype, Comp_req)
-				resultssti.append(ssti_status)
-				if ssti_attack:
-					sstireqresp.append(ssti_attack)
-					ssti_description.append(ssti_desc)
-				sstiflag = self.checkBetterScore(ssti_score, sstiflag)
-			else:
-				resultssti.append("Disabled")
-				sstireqresp.append(None)
-				ssti_description.append("")
+		results = [r for r in param_results if r is not None]
 
 		if self.xsscheck.isSelected():
 			if xssflag >= 2:
@@ -665,6 +634,29 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		else:
 			status = self.NOT_FOUND
 		return (status, score, attack, desc)
+	
+	def _test_single_param(self, request, headers, name, param_value, ptype, original_message, xss_enabled, sqli_enabled, ssti_enabled, baseline_time):
+		xss_status = self.NOT_FOUND
+		sqli_status = self.NOT_FOUND
+		ssti_status = self.NOT_FOUND
+		xss_score = 0
+		sqli_score = 0
+		ssti_score = 0
+		xss_attack = None
+		sqli_attack = None
+		ssti_attack = None
+		xss_desc = ""
+		sqli_desc = ""
+		ssti_desc = ""
+
+		if xss_enabled:
+			xss_status, xss_score, xss_attack, xss_desc = self._test_xss(request, headers, name, param_value, ptype, original_message)
+		if sqli_enabled:
+			sqli_status, sqli_score, sqli_attack, sqli_desc = self._test_sqli(request, headers, name, param_value, ptype, original_message, baseline_time)
+		if ssti_enabled:
+			ssti_status, ssti_score, ssti_attack, ssti_desc = self._test_ssti(request, headers, name, param_value, ptype, original_message)
+
+		return (xss_status, xss_score, xss_attack, xss_desc, sqli_status, sqli_score, sqli_attack, sqli_desc, ssti_status, ssti_score, ssti_attack, ssti_desc)
 
 	def makeRequest(self, messageInfo, message):
 		try:
