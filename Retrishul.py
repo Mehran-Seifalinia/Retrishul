@@ -759,7 +759,39 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 						attr_name = attr_segment.split()[0] if attr_segment else ""
 					return {'context': 'UNQUOTED_ATTR', 'tag_name': tag_name, 'attr_name': attr_name}
 
-		# If not inside any specific context, it's text node
+		# ---------- TEXT_NODE: Extract parent tag name safely ----------
+		# We are in a text node. To find the parent tag name, search backward
+		# from the position, but only consider tags that appear BEFORE the
+		# probe payload (i.e., before the 'PROBE_START' marker).
+		# Find where the probe payload starts in the response
+		probe_start_pos = response_str.find("PROBE_START")
+		if probe_start_pos != -1:
+			# Only search for parent tag up to the probe_start_pos
+			search_end = min(probe_start_pos, position)
+			if search_end > 0:
+				# Search backward from search_end for '<' followed by a letter
+				segment = response_str[:search_end]
+				last_open_tag_pos = -1
+				for i in range(len(segment) - 1, -1, -1):
+					if segment[i] == '<':
+						# Check if it's a closing tag (</)
+						if i + 1 < len(segment) and segment[i+1] == '/':
+							continue
+						# Check if after '<' there is a letter (opening tag)
+						if i + 1 < len(segment) and segment[i+1].isalpha():
+							last_open_tag_pos = i
+							break
+				if last_open_tag_pos != -1:
+					# Extract the tag name from this opening tag
+					tag_start = last_open_tag_pos
+					tag_name_end = segment.find(' ', tag_start + 1)
+					if tag_name_end == -1:
+						tag_name_end = segment.find('>', tag_start + 1)
+					if tag_name_end != -1:
+						possible_tag = segment[tag_start+1:tag_name_end]
+						if possible_tag and possible_tag[0].isalpha():
+							tag_name = possible_tag.split()[0] if ' ' in possible_tag else possible_tag
+
 		return {'context': 'TEXT_NODE', 'tag_name': tag_name, 'attr_name': attr_name}
 
 	def _generate_xss_payloads(self, context_info, reflected_chars):
@@ -959,7 +991,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		# Different payloads for different template engines, all with math operation
 		payloads = [
 			"{{7*7}}",		 # Jinja2 / Twig
-			"${7*7}",	     # JSP / Java / Freemarker
+			"${7*7}",		 # JSP / Java / Freemarker
 			"<%= 7*7 %>",    # ERB / Ruby
 			"#{7*7}"         # Ruby (alternative)
 		]
