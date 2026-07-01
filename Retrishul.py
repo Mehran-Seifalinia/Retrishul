@@ -572,12 +572,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		return (status, score, attack, description)
 		
 	def _test_sqli(self, request, headers, param_name, param_value, param_type, original_message, baseline_time):
-		"""Improved SQLi test with timeout false positive reduction"""
+		"""Improved SQLi test with timeout false positive reduction and fast mode support"""
 		# Read current values from config spinners
 		timeout_sec = int(self.sqlTimeoutSpinner.getValue())
 		threshold = float(self.sqlThresholdSpinner.getValue())
-		
 		value = "' and (select * from (select(sleep(5)))a)--"
+		
 		updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, value)
 		
 		if updated_request is None:
@@ -840,11 +840,26 @@ class Table(JTable):
 		logEntry = self._extender._log.get(self._extender.logTable.convertRowIndexToModel(row))
 		parameter = logEntry._parameter
 		resultxss = logEntry._resultxss
+		resultsqli = logEntry._resultsqli
+		resultssti = logEntry._resultssti
 		
+		# Add XSS issues
 		for i in range(len(parameter)):
 			status = resultxss[i] if i < len(resultxss) else "NO_STATUS"
 			if status == self._extender.CHECK or status == self._extender.FOUND:
 				self._extender.addIssues(self.xssroot, [parameter[i].getName()])
+		
+		# Add SQLi issues
+		for i in range(len(parameter)):
+			status = resultsqli[i] if i < len(resultsqli) else "NO_STATUS"
+			if status == self._extender.CHECK or status == self._extender.FOUND:
+				self._extender.addIssues(self.sqliroot, [parameter[i].getName()])
+		
+		# Add SSTI issues
+		for i in range(len(parameter)):
+			status = resultssti[i] if i < len(resultssti) else "NO_STATUS"
+			if status == self._extender.CHECK or status == self._extender.FOUND:
+				self._extender.addIssues(self.sstiroot, [parameter[i].getName()])
 		
 		self._extender.rowSelected = row
 		self._extender.tree.expandRow(0)
