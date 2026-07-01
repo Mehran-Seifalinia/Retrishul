@@ -4,6 +4,7 @@ from datetime import datetime
 from threading import Lock
 from json import loads, dumps
 from threading import Thread
+from re import search
 
 from javax.swing import JTable, JPanel, JToggleButton, JCheckBox, JMenuItem, JTree, JSplitPane, JEditorPane, JScrollPane, JTabbedPane, SwingUtilities, JLabel, JSpinner, SpinnerNumberModel
 from javax.swing.table import TableRowSorter, AbstractTableModel
@@ -13,6 +14,7 @@ from java.net import URLEncoder
 from java.awt import Color, Dimension
 from java.awt.event import MouseAdapter, AdjustmentListener, ActionListener
 from java.util import LinkedList, ArrayList
+from java.util.concurrent import Semaphore
 from java.lang import Runnable, Integer, String, Math
 
 # Initialize BurpExtender API to use Extender features
@@ -25,6 +27,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self._lock = Lock()		
 		self.intercept = 0
 		self.max_workers = 5
+		# Semaphore for limiting concurrent full-scan processes (per request)
+		self.semaphore = Semaphore(self.max_workers)
+		# Semaphore for limiting concurrent parameter tests inside each scan
+		self.param_semaphore = Semaphore(20)  # adjust as needed
 
 		# SQLi settings to reduce timeout false positives
 		self.sql_timeout_seconds = 10
@@ -354,158 +360,170 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			return None
 
 	# Main processing of ReTrishul
-	def sendRequestToReTrishul(self,messageInfo):
-		request = messageInfo.getRequest()
-		req_time = datetime.today()
-		requestURL = self._helpers.analyzeRequest(messageInfo).getUrl()
-		port = self._get_port(requestURL)
-		messageInfo = self._callbacks.makeHttpRequest(self._helpers.buildHttpService(str(requestURL.getHost()), port, requestURL.getProtocol() == "https"), request)
-		if messageInfo is None:
-			return
-		resp_time = datetime.today()
-		time_taken = (resp_time - req_time).total_seconds()
-		xss_enabled = self.xsscheck.isSelected()
-		sqli_enabled = self.sqlicheck.isSelected()
-		ssti_enabled = self.ssticheck.isSelected()
-		response = messageInfo.getResponse()
+	def sendRequestToReTrishul(self, messageInfo):
+		self.semaphore.acquire()
+		try:
+			request = messageInfo.getRequest()
+			req_time = datetime.today()
+			requestURL = self._helpers.analyzeRequest(messageInfo).getUrl()
+			port = self._get_port(requestURL)
+			messageInfo = self._callbacks.makeHttpRequest(self._helpers.buildHttpService(str(requestURL.getHost()), port, requestURL.getProtocol() == "https"), request)
+			if messageInfo is None:
+				return
+			resp_time = datetime.today()
+			time_taken = (resp_time - req_time).total_seconds()
+			xss_enabled = self.xsscheck.isSelected()
+			sqli_enabled = self.sqlicheck.isSelected()
+			ssti_enabled = self.ssticheck.isSelected()
+			response = messageInfo.getResponse()
 
-		# Initialozations of default value
-		final_SQLi = self.NOT_FOUND
-		final_SSTI = self.NOT_FOUND
-		final_XSS = self.NOT_FOUND
-		Comp_req = messageInfo
-		requestInfo = self._helpers.analyzeRequest(messageInfo)
-		self.content_resp = self._helpers.analyzeResponse(response)
-		requestURL = requestInfo.getUrl()
-		parameters = requestInfo.getParameters()
-		headers = requestInfo.getHeaders()
+			# Initialozations of default value
+			final_SQLi = self.NOT_FOUND
+			final_SSTI = self.NOT_FOUND
+			final_XSS = self.NOT_FOUND
+			Comp_req = messageInfo
+			requestInfo = self._helpers.analyzeRequest(messageInfo)
+			self.content_resp = self._helpers.analyzeResponse(response)
+			requestURL = requestInfo.getUrl()
+			parameters = requestInfo.getParameters()
+			headers = requestInfo.getHeaders()
 
-		# Used to obtain GET, POST and JSON parameters from burp API
-		param_new = [p for p in parameters if p.getType() == 0 or p.getType() == 1 or p.getType() == 6]
-		xssflag=0
-		sqliflag=0
-		sstiflag=0
-		resultxss = []
-		resultsqli = []
-		resultssti = []
-		xssreqresp = []
-		sqlireqresp = []
-		sstireqresp = []
-		ssti_description = []
-		sqli_description = []
-		xss_description = []
-		
-		# Add YAML parameters if Content-Type indicates YAML
-		headers_list = requestInfo.getHeaders()
-		for h in headers_list:
-			if 'Content-Type' in h and ('yaml' in h.lower() or 'yml' in h.lower()):
-				yaml_params = self._extract_yaml_parameters(request)
-				# Create fake parameter objects
-				class FakeParam:
-					def __init__(self, n, v, t):
-						self._name = n
-						self._value = v
-						self._type = t
-					def getName(self):
-						return self._name
-					def getValue(self):
-						return self._value
-					def getType(self):
-						return self._type
-				for name, value, typ in yaml_params:
-					param_new.append(FakeParam(name, value, typ))
-				break
-
-		# Parallel parameter testing using threads (Jython compatible)
-		results = []
-		threads = []
-		param_results = [None] * len(param_new)
-
-		def test_param(index, param):
-			name = param.getName()
-			ptype = param.getType()
-			param_value = param.getValue()
-			result = self._test_single_param(request, headers, name, param_value, ptype, Comp_req, xss_enabled, sqli_enabled, ssti_enabled, time_taken)
-			param_results[index] = (param, result)
-
-		for i, param in enumerate(param_new):
-			t = Thread(target=test_param, args=(i, param))
-			t.daemon = True
-			threads.append(t)
-			t.start()
-
-		# Wait for all threads
-		for t in threads:
-			t.join()
-
-		results = [r for r in param_results if r is not None]
-
-		# Process results from parallel tests
-		for param, result in results:
-			xss_status, xss_score, xss_attack, xss_desc, sqli_status, sqli_score, sqli_attack, sqli_desc, ssti_status, ssti_score, ssti_attack, ssti_desc = result
+			# Used to obtain GET, POST and JSON parameters from burp API
+			param_new = [p for p in parameters if p.getType() == 0 or p.getType() == 1 or p.getType() == 6]
+			xssflag=0
+			sqliflag=0
+			sstiflag=0
+			resultxss = []
+			resultsqli = []
+			resultssti = []
+			xssreqresp = []
+			sqlireqresp = []
+			sstireqresp = []
+			ssti_description = []
+			sqli_description = []
+			xss_description = []
 			
-			resultxss.append(xss_status)
-			resultsqli.append(sqli_status)
-			resultssti.append(ssti_status)
-			
-			if xss_attack:
-				xssreqresp.append(xss_attack)
-				xss_description.append(xss_desc)
-				xssflag = self.checkBetterScore(xss_score, xssflag)
-			
-			if sqli_attack:
-				sqlireqresp.append(sqli_attack)
-				sqli_description.append(sqli_desc)
-				sqliflag = self.checkBetterScore(sqli_score, sqliflag)
-			
-			if ssti_attack:
-				sstireqresp.append(ssti_attack)
-				ssti_description.append(ssti_desc)
-				sstiflag = self.checkBetterScore(ssti_score, sstiflag)
+			# Add YAML parameters if Content-Type indicates YAML
+			headers_list = requestInfo.getHeaders()
+			for h in headers_list:
+				if 'Content-Type' in h and ('yaml' in h.lower() or 'yml' in h.lower()):
+					yaml_params = self._extract_yaml_parameters(request)
+					# Create fake parameter objects
+					class FakeParam:
+						def __init__(self, n, v, t):
+							self._name = n
+							self._value = v
+							self._type = t
+						def getName(self):
+							return self._name
+						def getValue(self):
+							return self._value
+						def getType(self):
+							return self._type
+					for name, value, typ in yaml_params:
+						param_new.append(FakeParam(name, value, typ))
+					break
 
-		if self.xsscheck.isSelected():
-			html_xss_found = False
-			for i, status in enumerate(resultxss):
-				if (status == self.FOUND or status == self.CHECK) and xssreqresp[i] is not None:
-					resp = xssreqresp[i].getResponse()
-					if resp:
-						content = self._helpers.analyzeResponse(resp)
-						mime = content.getStatedMimeType().lower()
-						if "html" in mime or "text/html" in str(content.getHeaders()):
-							html_xss_found = True
-							break
-			
-			if html_xss_found and xssflag >= 2:
-				final_XSS = self.FOUND
-			elif xssflag >= 1:
-				final_XSS = self.CHECK   # CHECK for both HTML tentative and non-HTML reflection
+			# Parallel parameter testing using threads (Jython compatible) with semaphore
+			results = []
+			threads = []
+			param_results = [None] * len(param_new)
+
+			def test_param(index, param):
+				name = param.getName()
+				ptype = param.getType()
+				param_value = param.getValue()
+				result = self._test_single_param(request, headers, name, param_value, ptype, Comp_req, xss_enabled, sqli_enabled, ssti_enabled, time_taken)
+				param_results[index] = (param, result)
+
+			# Wrapper to acquire/release param_semaphore
+			def test_param_with_semaphore(index, param):
+				self.param_semaphore.acquire()
+				try:
+					test_param(index, param)
+				finally:
+					self.param_semaphore.release()
+
+			for i, param in enumerate(param_new):
+				t = Thread(target=test_param_with_semaphore, args=(i, param))
+				t.daemon = True
+				threads.append(t)
+				t.start()
+
+			# Wait for all threads
+			for t in threads:
+				t.join()
+
+			results = [r for r in param_results if r is not None]
+
+			# Process results from parallel tests
+			for param, result in results:
+				xss_status, xss_score, xss_attack, xss_desc, sqli_status, sqli_score, sqli_attack, sqli_desc, ssti_status, ssti_score, ssti_attack, ssti_desc = result
+				
+				resultxss.append(xss_status)
+				resultsqli.append(sqli_status)
+				resultssti.append(ssti_status)
+				
+				if xss_attack:
+					xssreqresp.append(xss_attack)
+					xss_description.append(xss_desc)
+					xssflag = self.checkBetterScore(xss_score, xssflag)
+				
+				if sqli_attack:
+					sqlireqresp.append(sqli_attack)
+					sqli_description.append(sqli_desc)
+					sqliflag = self.checkBetterScore(sqli_score, sqliflag)
+				
+				if ssti_attack:
+					sstireqresp.append(ssti_attack)
+					ssti_description.append(ssti_desc)
+					sstiflag = self.checkBetterScore(ssti_score, sstiflag)
+
+			if self.xsscheck.isSelected():
+				html_xss_found = False
+				for i, status in enumerate(resultxss):
+					if (status == self.FOUND or status == self.CHECK) and xssreqresp[i] is not None:
+						resp = xssreqresp[i].getResponse()
+						if resp:
+							content = self._helpers.analyzeResponse(resp)
+							mime = content.getStatedMimeType().lower()
+							if "html" in mime or "text/html" in str(content.getHeaders()):
+								html_xss_found = True
+								break
+				
+				if html_xss_found and xssflag >= 2:
+					final_XSS = self.FOUND
+				elif xssflag >= 1:
+					final_XSS = self.CHECK   # CHECK for both HTML tentative and non-HTML reflection
+				else:
+					final_XSS = self.NOT_FOUND
 			else:
-				final_XSS = self.NOT_FOUND
-		else:
-			final_XSS = "Disabled"
+				final_XSS = "Disabled"
 
-		if self.sqlicheck.isSelected():
-			if sqliflag > 3:
-				final_SQLi = self.FOUND
-			elif sqliflag > 2:
-				final_SQLi = self.CHECK
+			if self.sqlicheck.isSelected():
+				if sqliflag > 3:
+					final_SQLi = self.FOUND
+				elif sqliflag > 2:
+					final_SQLi = self.CHECK
+				else:
+					final_SQLi = self.NOT_FOUND
 			else:
-				final_SQLi = self.NOT_FOUND
-		else:
-			final_SQLi = "Disabled"
+				final_SQLi = "Disabled"
 
-		if self.ssticheck.isSelected():
-			if sstiflag > 1:
-				final_SSTI = self.FOUND
-			elif sstiflag > 0:
-				final_SSTI = self.CHECK
+			if self.ssticheck.isSelected():
+				if sstiflag > 1:
+					final_SSTI = self.FOUND
+				elif sstiflag > 0:
+					final_SSTI = self.CHECK
+				else:
+					final_SSTI = self.NOT_FOUND
 			else:
-				final_SSTI = self.NOT_FOUND
-		else:
-			final_SSTI = "Disabled"
+				final_SSTI = "Disabled"
 
-		self.addToLog(messageInfo, final_XSS, final_SQLi, final_SSTI, param_new, resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp , xss_description, sqli_description, ssti_description, req_time.strftime('%H:%M:%S %m/%d/%y'))
-
+			self.addToLog(messageInfo, final_XSS, final_SQLi, final_SSTI, param_new, resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp , xss_description, sqli_description, ssti_description, req_time.strftime('%H:%M:%S %m/%d/%y'))
+		finally:
+			self.semaphore.release()
+	
 	# Function used to check if the score originally and mentioned is better
 	def checkBetterScore(self, score, ogscore):
 		if score > ogscore:
@@ -519,177 +537,478 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		return port
 		
 	def _test_xss(self, request, headers, param_name, param_value, param_type, original_message):
-		"""Improved XSS detection with more accurate reflection checking to reduce false positives"""
-		payload_array = ["<", ">", "'", "\"", "\\", "`", "{", "}", "/*", "*/", "alert(1)", "onerror=alert(1)"]
-		json_payload_array = ["<", ">", "'", "\"", "\\", "`", "{", "}", "alert(1)"]
-		
-		rand_str = "xss_test_"
-		payload_all = rand_str + "".join(payload_array)
-		json_payload = rand_str + "".join(json_payload_array)
+		"""
+		Advanced XSS detection with context-aware payload generation.
+		Phase 1: Probe with neutral marker for context detection.
+		Phase 2: Detect reflection context using neutral marker position.
+		Phase 3: Generate and test targeted payloads based on reflected chars and context.
+		"""
+		# ---------- Phase 1: Probe for raw character reflection ----------
+		# Use a neutral marker (no special chars) to locate reflection position for context.
+		probe_start = "PROBE_START"
+		probe_end = "PROBE_END"
+		# Markers for special characters (each contains a unique substring and the actual char)
+		# Format: "KEY_char" where char is the actual special character.
+		marker_defs = [
+			("LT", "<"), ("GT", ">"), ("QUOT", "\""), ("SING", "'"),
+			("SLASH", "/"), ("BSLASH", "\\"), ("BACKTICK", "`"),
+			("BRACE_O", "{"), ("BRACE_C", "}"), ("PAREN_O", "("),
+			("PAREN_C", ")"), ("EQ", "="), ("ALERT", "alert"),
+			("ONERROR", "onerror"), ("SCRIPT", "script")
+		]
+		# Build probe payload: neutral start + all markers + neutral end
+		probe_payload = probe_start
+		for key, char in marker_defs:
+			probe_payload += "XSS_" + key + "_" + char
+		probe_payload += probe_end
 
-		if param_type in (0, 1):
-			updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, payload_all)
-		else:
-			updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, json_payload)
-			if updated_request is None:
-				return (self.NOT_FOUND, 0, None, "")
-
-		attack = self.makeRequest(original_message, updated_request)
-		if attack is None:
-			return (self.NOT_FOUND, 0, None, "")
-
-		response = attack.getResponse()
-		response_str = self._helpers.bytesToString(response)
-		
-		# Check response type
-		content_resp = self._helpers.analyzeResponse(response)
-		mime_type = content_resp.getStatedMimeType().lower()
-		is_html = "html" in mime_type or "text/html" in str(content_resp.getHeaders())
-		is_json = "json" in mime_type or "application/json" in str(content_resp.getHeaders())
-
-		score = 0
-		reflected = []
-
-		# More accurate reflection check
-		for p in payload_array:
-			# Must contain the unique rand_str + payload part for strong reflection
-			if (rand_str + p in response_str) or (p in response_str and rand_str in response_str):
-				reflected.append(p.replace('<', '&lt;'))
-				score += 1
-
-		# Decision logic
-		if score >= 3 and is_html:
-			status = self.FOUND
-		elif score >= 5 and is_json:          # Strong reflection required for JSON
-			status = self.FOUND
-		elif score >= 3:                      # Medium reflection in other types
-			status = self.CHECK
-		elif score >= 2:
-			status = self.CHECK
-		else:
-			status = self.NOT_FOUND
-
-		description = ""
-		if reflected:
-			if is_html:
-				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Reflected characters: " + ", ".join(reflected) + "<br>Parameter <b>" + self._helpers.urlDecode(param_name) + "</b> appears vulnerable to Reflected XSS."
-			elif is_json and status == self.FOUND:
-				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Strong reflection detected in JSON response (" + str(score) + " characters).<br>Parameter <b>" + self._helpers.urlDecode(param_name) + "</b> may be vulnerable in certain contexts (e.g. JSONP or client-side parsing)."
-			else:
-				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Reflected characters: " + ", ".join(reflected) + "<br>Response Content-Type: <b>" + mime_type + "</b>. Reflection found but check manually."
-
-		return (status, score, attack, description)
-		
-	def _test_sqli(self, request, headers, param_name, param_value, param_type, original_message, baseline_time):
-		"""Improved SQLi test with timeout false positive reduction and fast mode support"""
-		# Read current values from config spinners
-		timeout_sec = int(self.sqlTimeoutSpinner.getValue())
-		threshold = float(self.sqlThresholdSpinner.getValue())
-		value = "' and (select * from (select(sleep(5)))a)--"
-		
-		updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, value)
-		
+		updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, probe_payload)
 		if updated_request is None:
 			return (self.NOT_FOUND, 0, None, "")
 
-		orig = datetime.today()
-		attack = self.makeRequest(original_message, updated_request)
-		
-		if attack is None:
+		probe_response = self.makeRequest(original_message, updated_request)
+		if probe_response is None:
 			return (self.NOT_FOUND, 0, None, "")
-			
-		new_time = datetime.today()
-		response_str = self._helpers.bytesToString(attack.getResponse())
-		diff = (new_time - orig).total_seconds()
-		
-		score = 0
-		found_text = ""
-		
-		# Error-based detection
-		for error in self.error_array:
-			if error in response_str:
-				found_text += error + " "
-				score += 2
 
-		# Time-based detection with FP filter
-		is_timeout = diff >= self.sql_max_reasonable_delay
-		if not is_timeout and diff > threshold:
-			score += 3
+		response_bytes = probe_response.getResponse()
+		if response_bytes is None:
+			return (self.NOT_FOUND, 0, None, "")
+		response_str = self._helpers.bytesToString(response_bytes)
 
-		if score > 3:
-			status = self.FOUND
-		elif score > 1:
-			status = self.CHECK
+		# Find neutral marker positions (use start for context detection)
+		start_pos = response_str.find(probe_start)
+		if start_pos == -1:
+			return (self.NOT_FOUND, 0, None, "")
+
+		# Determine which special characters are reflected raw (the marker string itself appears)
+		reflected_chars = set()
+		for key, char in marker_defs:
+			marker = "XSS_" + key + "_" + char
+			if marker in response_str:
+				reflected_chars.add(char)
+
+		# Early exit: if no critical raw chars are reflected, XSS is highly unlikely
+		if not reflected_chars:
+			return (self.NOT_FOUND, 0, None, "")
+
+		# ---------- Phase 2: Detect context using the neutral marker position ----------
+		context_info = self._detect_context(response_str, start_pos)
+
+		# ---------- Phase 3: Generate and test targeted payloads ----------
+		payloads = self._generate_xss_payloads(context_info, reflected_chars)
+
+		best_score = 0
+		best_status = self.NOT_FOUND
+		best_attack = None
+		best_desc = ""
+
+		# Test each generated payload
+		for idx, payload_template in enumerate(payloads):
+			# Add a unique marker to verify raw reflection for this specific payload
+			unique_marker = "XSS_MARKER_%d_" % idx
+			# Construct the final payload: marker + template (with context placeholders filled)
+			final_payload = payload_template.format(
+				marker=unique_marker,
+				tag=context_info.get('tag_name', 'div'),
+				attr=context_info.get('attr_name', '')
+			)
+
+			updated_request = self._buildUpdatedRequest(
+				request, headers, param_name, param_value, param_type, final_payload
+			)
+			if updated_request is None:
+				continue
+
+			attack = self.makeRequest(original_message, updated_request)
+			if attack is None:
+				continue
+
+			attack_response = attack.getResponse()
+			if attack_response is None:
+				continue
+			attack_response_str = self._helpers.bytesToString(attack_response)
+
+			# Check if our unique marker is reflected raw
+			if unique_marker in attack_response_str:
+				# Raw reflection of the marker indicates the payload structure worked
+				score_increment = 2
+				desc = "Payload <b>%s</b> reflected successfully with marker <b>%s</b>." % (
+					self._helpers.urlDecode(final_payload.replace(unique_marker, "")),
+					unique_marker
+				)
+				# Bonus if this is a sensitive context
+				if context_info['context'] in ['QUOTED_ATTR', 'UNQUOTED_ATTR', 'SCRIPT_BLOCK']:
+					score_increment += 1
+				if "alert" in final_payload and "alert" in attack_response_str:
+					score_increment += 1  # Strong evidence
+
+				best_score += score_increment
+				if score_increment >= 2 and best_attack is None:
+					best_attack = attack
+					best_desc = desc
+			else:
+				# Marker not reflected raw, maybe it was encoded or filtered
+				continue
+
+		# Determine final status based on best_score
+		if best_score >= 4:
+			best_status = self.FOUND
+		elif best_score >= 2:
+			best_status = self.CHECK
 		else:
-			status = self.NOT_FOUND
+			best_status = self.NOT_FOUND
 
-		desc = ""
-		if found_text:
-			desc = "The payload <b>" + self._helpers.urlDecode(value) + "</b> was passed for parameter <b>" + self._helpers.urlDecode(param_name) + "</b>.<br>Database errors detected: " + found_text
-		elif not is_timeout and diff > threshold:
-			desc = "The payload <b>" + self._helpers.urlDecode(value) + "</b> was passed for parameter <b>" + self._helpers.urlDecode(param_name) + "</b>.<br>Response delayed <b>" + str(round(diff, 2)) + "</b>s (baseline: " + str(round(baseline_time, 2)) + "s). Likely time-based SQLi."
-		elif is_timeout:
-			desc = "High delay detected but likely caused by timeout/WAF. Not counted as vulnerability."
+		if best_attack is None:
+			# If no payload worked but we had raw chars, at least return the probe response
+			return (best_status, best_score, probe_response, "Raw chars reflected but no specific payload succeeded. Manual check advised.")
+		
+		return (best_status, best_score, best_attack, best_desc)
 
-		return (status, score, attack, desc)
+	def _detect_context(self, response_str, position):
+		"""
+		Detect the HTML context at a given position in the response string.
+		Uses a simple state machine to avoid confusion with embedded markers.
+		Returns a dict: {'context': str, 'tag_name': str, 'attr_name': str}
+		Possible contexts: TEXT_NODE, QUOTED_ATTR, UNQUOTED_ATTR, SCRIPT_BLOCK,
+						   TEXTAREA, COMMENT, STYLE
+		"""
+		# Get a window around the position (e.g., 300 chars each side)
+		start = max(0, position - 300)
+		end = min(len(response_str), position + 300)
+		window = response_str[start:end]
+		rel_pos = position - start
+
+		# Initialize context
+		context = "TEXT_NODE"
+		tag_name = ""
+		attr_name = ""
+
+		# 1. Check if inside a comment <!-- ... -->
+		comment_start = window.rfind("<!--", 0, rel_pos)
+		comment_end = window.find("-->", rel_pos)
+		if comment_start != -1 and comment_end != -1 and comment_start < rel_pos < comment_end:
+			return {'context': 'COMMENT', 'tag_name': '', 'attr_name': ''}
+
+		# 2. Check if inside <script> ... </script>
+		script_start = window.rfind("<script", 0, rel_pos)
+		script_end = window.find("</script", rel_pos)
+		if script_start != -1 and script_end != -1 and script_start < rel_pos < script_end:
+			return {'context': 'SCRIPT_BLOCK', 'tag_name': 'script', 'attr_name': ''}
+
+		# 3. Check if inside <textarea> ... </textarea>
+		textarea_start = window.rfind("<textarea", 0, rel_pos)
+		textarea_end = window.find("</textarea", rel_pos)
+		if textarea_start != -1 and textarea_end != -1 and textarea_start < rel_pos < textarea_end:
+			return {'context': 'TEXTAREA', 'tag_name': 'textarea', 'attr_name': ''}
+
+		# 4. Check if inside <style> ... </style>
+		style_start = window.rfind("<style", 0, rel_pos)
+		style_end = window.find("</style", rel_pos)
+		if style_start != -1 and style_end != -1 and style_start < rel_pos < style_end:
+			return {'context': 'STYLE', 'tag_name': 'style', 'attr_name': ''}
+
+		# 5. Check if inside an HTML tag (between < and >)
+		# Find the nearest '<' before position
+		open_tag_start = window.rfind("<", 0, rel_pos)
+		if open_tag_start != -1:
+			# Find the '>' that closes this tag, starting from the '<' itself
+			open_tag_end = window.find(">", open_tag_start + 1)
+			if open_tag_end != -1 and open_tag_start < rel_pos < open_tag_end:
+				# We are inside a tag
+				tag_content = window[open_tag_start:open_tag_end]
+				# Extract tag name
+				tag_name_match = search(r"<([a-zA-Z0-9]+)", tag_content)
+				if tag_name_match:
+					tag_name = tag_name_match.group(1)
+				
+				# Check if inside quotes
+				last_double_quote = tag_content.rfind('"', 0, rel_pos - open_tag_start)
+				last_single_quote = tag_content.rfind("'", 0, rel_pos - open_tag_start)
+				next_double_quote = tag_content.find('"', rel_pos - open_tag_start)
+				next_single_quote = tag_content.find("'", rel_pos - open_tag_start)
+
+				in_quotes = False
+				quote_char = None
+				if last_double_quote > last_single_quote and (next_double_quote == -1 or next_double_quote > rel_pos - open_tag_start):
+					in_quotes = True
+					quote_char = '"'
+				elif last_single_quote > last_double_quote and (next_single_quote == -1 or next_single_quote > rel_pos - open_tag_start):
+					in_quotes = True
+					quote_char = "'"
+
+				if in_quotes:
+					# Extract attribute name
+					attr_start = tag_content.rfind(" ", 0, rel_pos - open_tag_start)
+					if attr_start == -1:
+						attr_start = 0
+					attr_segment = tag_content[attr_start:rel_pos - open_tag_start].strip()
+					if '=' in attr_segment:
+						attr_name = attr_segment.split('=')[0].strip()
+					else:
+						attr_name = attr_segment.split()[0] if attr_segment else ""
+					return {'context': 'QUOTED_ATTR', 'tag_name': tag_name, 'attr_name': attr_name}
+				else:
+					# Inside tag but not in quotes (unquoted attribute)
+					attr_start = tag_content.rfind(" ", 0, rel_pos - open_tag_start)
+					if attr_start == -1:
+						attr_start = 0
+					attr_segment = tag_content[attr_start:rel_pos - open_tag_start].strip()
+					if '=' in attr_segment:
+						attr_name = attr_segment.split('=')[0].strip()
+					else:
+						attr_name = attr_segment.split()[0] if attr_segment else ""
+					return {'context': 'UNQUOTED_ATTR', 'tag_name': tag_name, 'attr_name': attr_name}
+
+		# If not inside any specific context, it's text node
+		return {'context': 'TEXT_NODE', 'tag_name': tag_name, 'attr_name': attr_name}
+
+	def _generate_xss_payloads(self, context_info, reflected_chars):
+		"""
+		Generate a list of payload templates filtered by available raw reflected characters.
+		Each template is a string that can be formatted with {marker}, {tag}, {attr}.
+		"""
+		context = context_info['context']
+		tag = context_info.get('tag_name', 'div')
+		attr = context_info.get('attr_name', '')
+
+		# Base payload templates with their requirements (characters that must be reflected raw)
+		all_templates = []
+
+		# --- Payloads for TEXT_NODE ---
+		if context == 'TEXT_NODE':
+			if '<' in reflected_chars and '>' in reflected_chars:
+				all_templates.append({
+					'requires': {'<', '>'},
+					'template': '</{tag}><script>alert("{marker}")</script><{tag}>'
+				})
+				all_templates.append({
+					'requires': {'<', '>'},
+					'template': '<script>alert("{marker}")</script>'
+				})
+				all_templates.append({
+					'requires': {'<', '>', '='},
+					'template': '<img src=x onerror=alert("{marker}")>'
+				})
+
+		# --- Payloads for QUOTED_ATTR ---
+		elif context == 'QUOTED_ATTR':
+			if '"' in reflected_chars:
+				all_templates.append({
+					'requires': {'"'},
+					'template': '" onerror=alert("{marker}") "'
+				})
+				all_templates.append({
+					'requires': {'"'},
+					'template': '" autofocus onfocus=alert("{marker}") "'
+				})
+				if '>' in reflected_chars and '<' in reflected_chars:
+					all_templates.append({
+						'requires': {'"', '>', '<'},
+						'template': '" ><script>alert("{marker}")</script><{tag} "'
+					})
+			if "'" in reflected_chars:
+				all_templates.append({
+					'requires': {"'"},
+					'template': "' onerror=alert('{marker}') '"
+				})
+				all_templates.append({
+					'requires': {"'"},
+					'template': "' autofocus onfocus=alert('{marker}') '"
+				})
+
+		# --- Payloads for UNQUOTED_ATTR ---
+		elif context == 'UNQUOTED_ATTR':
+			all_templates.append({
+				'requires': set(),
+				'template': ' onerror=alert("{marker}")'
+			})
+			all_templates.append({
+				'requires': set(),
+				'template': ' autofocus onfocus=alert("{marker}")'
+			})
+			if '>' in reflected_chars and '<' in reflected_chars:
+				all_templates.append({
+					'requires': {'>', '<'},
+					'template': ' ><script>alert("{marker}")</script><{tag} '
+				})
+
+		# --- Payloads for SCRIPT_BLOCK ---
+		elif context == 'SCRIPT_BLOCK':
+			if '<' in reflected_chars and '>' in reflected_chars and '/' in reflected_chars:
+				all_templates.append({
+					'requires': {'<', '>', '/'},
+					'template': '</script><script>alert("{marker}")</script>'
+				})
+			if "'" in reflected_chars:
+				all_templates.append({
+					'requires': {"'"},
+					'template': "'; alert('{marker}'); //"
+				})
+			if '"' in reflected_chars:
+				all_templates.append({
+					'requires': {'"'},
+					'template': '"; alert("{marker}"); //'
+				})
+
+		# --- Payloads for TEXTAREA ---
+		elif context == 'TEXTAREA':
+			if '<' in reflected_chars and '>' in reflected_chars and '/' in reflected_chars:
+				all_templates.append({
+					'requires': {'<', '>', '/'},
+					'template': '</textarea><script>alert("{marker}")</script>'
+				})
+
+		# --- Payloads for COMMENT ---
+		elif context == 'COMMENT':
+			if '-' in reflected_chars and '>' in reflected_chars and '<' in reflected_chars:
+				all_templates.append({
+					'requires': {'-', '>', '<'},
+					'template': '--><script>alert("{marker}")</script>'
+				})
+
+		# --- Payloads for STYLE (limited, just try to break out) ---
+		elif context == 'STYLE':
+			if '<' in reflected_chars and '>' in reflected_chars and '/' in reflected_chars:
+				all_templates.append({
+					'requires': {'<', '>', '/'},
+					'template': '</style><script>alert("{marker}")</script>'
+				})
+
+		# Filter templates based on available reflected characters
+		# A template is valid if all its required chars are in reflected_chars
+		valid_templates = []
+		for t in all_templates:
+			if t['requires'].issubset(reflected_chars):
+				valid_templates.append(t['template'])
+
+		return valid_templates
+		
+	def _test_sqli(self, request, headers, param_name, param_value, param_type, original_message, baseline_time):
+		"""SQLi detection with combined error and time-based payloads"""
+		# Read config
+		threshold = float(self.sqlThresholdSpinner.getValue())
+		
+		# Error-based payload (single quote to trigger errors)
+		error_payload = "'"
+		# Time-based payload (sleep)
+		time_payload = "' AND SLEEP(5)--"
+		
+		best_status = self.NOT_FOUND
+		best_score = 0
+		best_attack = None
+		best_desc = ""
+		
+		# 1. Test error-based payload first (faster and cheaper)
+		updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, error_payload)
+		if updated_request:
+			attack = self.makeRequest(original_message, updated_request)
+			if attack:
+				response_str = self._helpers.bytesToString(attack.getResponse())
+				score = 0
+				found_errors = []
+				for error in self.error_array:
+					if error in response_str:
+						found_errors.append(error)
+						score += 2
+				if score > 0:
+					status = self.FOUND if score > 3 else self.CHECK
+					best_score = score
+					best_status = status
+					best_attack = attack
+					best_desc = "Error-based SQLi detected with payload <b>" + self._helpers.urlDecode(error_payload) + "</b>. Errors: " + ", ".join(found_errors)
+		
+		# 2. Test time-based payload (always test for completeness)
+		updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, time_payload)
+		if updated_request:
+			orig = datetime.today()
+			attack = self.makeRequest(original_message, updated_request)
+			if attack:
+				new_time = datetime.today()
+				diff = (new_time - orig).total_seconds()
+				response_str = self._helpers.bytesToString(attack.getResponse())
+				
+				score = 0
+				is_timeout = diff >= self.sql_max_reasonable_delay
+				if not is_timeout and diff > threshold:
+					score += 3
+					# Also check for errors in time-based response (in case of blind)
+					for error in self.error_array:
+						if error in response_str:
+							score += 1
+							break
+				
+				if score > best_score:
+					best_score = score
+					best_status = self.FOUND if score > 3 else (self.CHECK if score > 1 else self.NOT_FOUND)
+					best_attack = attack
+					if not is_timeout and diff > threshold:
+						best_desc = "Time-based SQLi detected with payload <b>" + self._helpers.urlDecode(time_payload) + "</b>. Delay: " + str(round(diff, 2)) + "s (baseline: " + str(round(baseline_time, 2)) + "s)."
+					elif is_timeout:
+						best_desc = "High delay detected but likely caused by timeout/WAF. Not counted as vulnerability."
+					else:
+						best_desc = "No clear SQLi evidence found."
+		
+		if best_attack is None:
+			return (self.NOT_FOUND, 0, None, "")
+		
+		return (best_status, best_score, best_attack, best_desc)
 
 	def _test_ssti(self, request, headers, param_name, param_value, param_type, original_message):
-		payload_array = ["${123*456}", "<%=123*567%>", "{{123*678}}"]
-		json_payload_array = ["$\{123*456\}", "<%=123*567%>", "\{\{123*678\}\}"]
-		rand_str = "jjjjjjj"
-		payload_all = ""
-		json_payload = ""
-		for payload in payload_array:
-			payload_all += rand_str + payload
-		for payload in json_payload_array:
-			json_payload += rand_str + payload
-		if param_type in (0, 1):
-			updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, payload_all)
-		else:
-			updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, json_payload)
-			if updated_request is None:
-				return (self.NOT_FOUND, 0, None, "")
-		attack = self.makeRequest(original_message, updated_request)
-		if attack is None:
+		"""SSTI detection with separate payloads for different template engines"""
+		rand_str = "ssti_rand_"
+		# Different payloads for different template engines, all with math operation
+		payloads = [
+			"{{7*7}}",		 # Jinja2 / Twig
+			"${7*7}",	     # JSP / Java / Freemarker
+			"<%= 7*7 %>",    # ERB / Ruby
+			"#{7*7}"         # Ruby (alternative)
+		]
+		
+		best_status = self.NOT_FOUND
+		best_score = 0
+		best_attack = None
+		best_desc = ""
+		
+		for payload in payloads:
+			full_payload = rand_str + payload
+			
+			if param_type in (0, 1):
+				updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, full_payload)
+			else:
+				updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, full_payload)
+				if updated_request is None:
+					continue
+			
+			attack = self.makeRequest(original_message, updated_request)
+			if attack is None:
+				continue
+			
+			attack = self.markHttpMessage(attack, rand_str)
+			response_str = self._helpers.bytesToString(attack.getResponse())
+			
+			score = 0
+			if rand_str + "49" in response_str:
+				score = 3  # Strong evidence
+				status = self.FOUND
+				desc = "Parameter <b>%s</b> evaluated <b>7*7</b> to <b>49</b> using payload <b>%s</b>. Template injection confirmed." % (self._helpers.urlDecode(param_name), payload)
+			elif "49" in response_str and rand_str in response_str:
+				score = 2  # Moderate evidence
+				status = self.CHECK
+				desc = "Parameter <b>%s</b> seems to evaluate expressions. Payload <b>%s</b> produced <b>49</b> in response. Manual check required." % (self._helpers.urlDecode(param_name), payload)
+			else:
+				status = self.NOT_FOUND
+				desc = ""
+			
+			if score > best_score:
+				best_score = score
+				best_status = status
+				best_attack = attack
+				best_desc = desc
+		
+		if best_attack is None:
 			return (self.NOT_FOUND, 0, None, "")
-		attack = self.markHttpMessage(attack, rand_str)
-		response_str = self._helpers.bytesToString(attack.getResponse())
-		score = 0
-		desc = ""
-		desc_parts = []
-		for output in self.expected_output:
-			if_found = rand_str + output
-			if if_found in response_str:
-				if output == "56088":
-					desc_parts.append("Parameter <b>%s</b> is using <b>Java</b> Template<br>The value <b>${123*456}</b> was passed which gave result as <b>56088</b>" % self._helpers.urlDecode(param_name))
-					score = max(score, 2)
-				elif output == "69741":
-					desc_parts.append("Parameter <b>%s</b> is using <b>Ruby</b> Template<br>The value <b><%=123*567%></b> was passed which gave result as <b>69741</b>" % self._helpers.urlDecode(param_name))
-					score = max(score, 2)
-				elif output == "83394":
-					payload_twig = "{{5*'777'}}"
-					if param_type in (0,1):
-						req2 = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, payload_twig)
-					else:
-						req2 = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, "{{5*'777'}}")
-					if req2:
-						attack2 = self.makeRequest(original_message, req2)
-						if attack2:
-							resp2 = self._helpers.bytesToString(attack2.getResponse())
-							if "3885" in resp2:
-								desc_parts.append("Parameter <b>%s</b> is using <b>Twig</b> Template<br>The value <b>{{5*'777'}}</b> was passed which gave result as <b>3885</b>" % self._helpers.urlDecode(param_name))
-								score = max(score, 2)
-							elif "777777777777777" in resp2:
-								desc_parts.append("Parameter <b>%s</b> is using <b>Jinja2</b> Template<br>The value <b>{{5*'777'}}</b> was passed which gave result as <b>777777777777777</b>" % self._helpers.urlDecode(param_name))
-								score = max(score, 2)
-		desc = "<br>".join(desc_parts) if desc_parts else ""
-		if score > 1:
-			status = self.FOUND
-		elif score > 0:
-			status = self.CHECK
-		else:
-			status = self.NOT_FOUND
-		return (status, score, attack, desc)
+		
+		return (best_status, best_score, best_attack, best_desc)
 	
 	def _test_single_param(self, request, headers, name, param_value, ptype, original_message, xss_enabled, sqli_enabled, ssti_enabled, baseline_time):
 		xss_status = self.NOT_FOUND
