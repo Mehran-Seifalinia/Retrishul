@@ -519,7 +519,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		return port
 		
 	def _test_xss(self, request, headers, param_name, param_value, param_type, original_message):
-		"""Improved XSS detection - No FOUND for non-HTML responses"""
+		"""Improved XSS detection with more accurate reflection checking to reduce false positives"""
 		payload_array = ["<", ">", "'", "\"", "\\", "`", "{", "}", "/*", "*/", "alert(1)", "onerror=alert(1)"]
 		json_payload_array = ["<", ">", "'", "\"", "\\", "`", "{", "}", "alert(1)"]
 		
@@ -541,24 +541,31 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		response = attack.getResponse()
 		response_str = self._helpers.bytesToString(response)
 		
-		# Check if response is HTML
+		# Check response type
 		content_resp = self._helpers.analyzeResponse(response)
 		mime_type = content_resp.getStatedMimeType().lower()
 		is_html = "html" in mime_type or "text/html" in str(content_resp.getHeaders())
+		is_json = "json" in mime_type or "application/json" in str(content_resp.getHeaders())
 
 		score = 0
 		reflected = []
 
+		# More accurate reflection check
 		for p in payload_array:
-			if rand_str + p in response_str or p in response_str:
+			# Must contain the unique rand_str + payload part for strong reflection
+			if (rand_str + p in response_str) or (p in response_str and rand_str in response_str):
 				reflected.append(p.replace('<', '&lt;'))
 				score += 1
 
-		# Strict rule: Non-HTML responses never get FOUND
+		# Decision logic
 		if score >= 3 and is_html:
 			status = self.FOUND
+		elif score >= 5 and is_json:          # Strong reflection required for JSON
+			status = self.FOUND
+		elif score >= 3:                      # Medium reflection in other types
+			status = self.CHECK
 		elif score >= 2:
-			status = self.CHECK   # CHECK for both HTML and non-HTML reflection
+			status = self.CHECK
 		else:
 			status = self.NOT_FOUND
 
@@ -566,8 +573,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		if reflected:
 			if is_html:
 				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Reflected characters: " + ", ".join(reflected) + "<br>Parameter <b>" + self._helpers.urlDecode(param_name) + "</b> appears vulnerable to Reflected XSS."
+			elif is_json and status == self.FOUND:
+				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Strong reflection detected in JSON response (" + str(score) + " characters).<br>Parameter <b>" + self._helpers.urlDecode(param_name) + "</b> may be vulnerable in certain contexts (e.g. JSONP or client-side parsing)."
 			else:
-				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Reflected characters: " + ", ".join(reflected) + "<br>Response Content-Type is <b>" + mime_type + "</b>. Reflection found but likely not exploitable XSS (API)."
+				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Reflected characters: " + ", ".join(reflected) + "<br>Response Content-Type: <b>" + mime_type + "</b>. Reflection found but check manually."
 
 		return (status, score, attack, description)
 		
