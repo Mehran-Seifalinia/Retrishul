@@ -6,19 +6,33 @@ from json import loads, dumps
 from threading import Thread
 from re import search
 
-from javax.swing import JTable, JPanel, JToggleButton, JCheckBox, JMenuItem, JTree, JSplitPane, JEditorPane, JScrollPane, JTabbedPane, SwingUtilities, JLabel, JSpinner, SpinnerNumberModel
+from javax.swing import JTable, JPanel, JToggleButton, JCheckBox, JMenuItem, JTree, JSplitPane, JEditorPane, JScrollPane, JTabbedPane, SwingUtilities, JLabel, JSpinner, SpinnerNumberModel, JButton, BorderFactory, Timer
 from javax.swing.table import TableRowSorter, AbstractTableModel
 from javax.swing.tree import DefaultMutableTreeNode, TreePath
 from javax.swing.text.html import HTMLEditorKit
 from java.net import URLEncoder
-from java.awt import Color, Dimension
+from java.awt import Color, Dimension, Toolkit, BorderLayout
 from java.awt.event import MouseAdapter, AdjustmentListener, ActionListener
+from java.awt.datatransfer import StringSelection
 from java.util import LinkedList, ArrayList
 from java.util.concurrent import Semaphore
 from java.lang import Runnable, Integer, String, Math
 
 # Initialize BurpExtender API to use Extender features
 class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController, AbstractTableModel, IContextMenuFactory, IHttpRequestResponseWithMarkers, ITextEditor):
+	def copyPayload(self, event):
+		text = self.payloadEditor.getText()
+		if text:
+			clipboard = Toolkit.getDefaultToolkit().getSystemClipboard()
+			clipboard.setContents(StringSelection(text), None)
+			self.payloadEditor.setBorder(BorderFactory.createLineBorder(Color.GREEN, 2))
+			# Reset border after 2 seconds using a timer
+			def resetBorder(e):
+				self.payloadEditor.setBorder(BorderFactory.createLineBorder(Color.GRAY, 1))
+			timer = Timer(2000, resetBorder)
+			timer.setRepeats(False)
+			timer.start()
+	
 	def registerExtenderCallbacks(self, callbacks):
 		self._callbacks = callbacks
 		self._helpers = callbacks.getHelpers()
@@ -143,6 +157,23 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self._texteditor = self._callbacks.createTextEditor()
 		self._texteditor.setEditable(False)
 
+		# New Payload tab
+		self.payloadEditor = JEditorPane("text/plain", "")
+		self.payloadEditor.setEditable(False)
+		self.payloadEditor.setBorder(BorderFactory.createLineBorder(Color.GRAY, 1))
+		self.payloadScroll = JScrollPane(self.payloadEditor)
+		self.payloadScroll.setPreferredSize(Dimension(300, 450))
+		
+		self.copyButton = JButton("Copy Payload", actionPerformed=self.copyPayload)
+		self.copyButton.setEnabled(False)
+		
+		self.payloadPanel = JPanel(BorderLayout())
+		self.payloadPanel.add(self.payloadScroll, BorderLayout.CENTER)
+		
+		buttonPanel = JPanel()
+		buttonPanel.add(self.copyButton)
+		self.payloadPanel.add(buttonPanel, BorderLayout.SOUTH)
+
 	def _adjustDivider(self):
 		self._splitpane.setDividerLocation(0.8)
 
@@ -171,7 +202,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		self.tabs.addTab("Advisory",self.advisorypanel)
 		self.tabs.addTab("Request", self._requestViewer.getComponent())
 		self.tabs.addTab("Response", self._responseViewer.getComponent())
-		self.tabs.addTab("Highlighted Response", self._texteditor.getComponent())
+		self.tabs.addTab("Payload", self.payloadPanel)
 		self._bottomsplit.setRightComponent(self.tabs)
 		self._splitpane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
 		self._splitpane.setResizeWeight(1)
@@ -302,9 +333,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 							t.start()
 		return
 
-	def _buildUpdatedRequest(self, request, headers, param_name, param_value, param_type, new_value):
+	def _buildUpdatedRequest(self, request, headers, param_name, param_value, param_type, new_value, encode=True):
 		if param_type in (0, 1):
-			encoded_value = URLEncoder.encode(new_value, "UTF-8")
+			if encode:
+				encoded_value = URLEncoder.encode(new_value, "UTF-8")
+			else:
+				encoded_value = new_value
 			new_param = self._helpers.buildParameter(param_name, encoded_value, param_type)
 			return self._helpers.updateParameter(request, new_param)
 		elif param_type == 6:  # JSON
@@ -338,7 +372,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			except Exception as e:
 				print("[ReTrishul] JSON update error:", e)
 				return None
-		elif param_type == 7:  # YAML (simple line replacement)
+		elif param_type == 7:  # YAML
 			request_str = self._helpers.bytesToString(request)
 			lines = request_str.splitlines()
 			new_lines = []
@@ -402,6 +436,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			ssti_description = []
 			sqli_description = []
 			xss_description = []
+			xss_payloads = []
 			
 			# Add YAML parameters if Content-Type indicates YAML
 			headers_list = requestInfo.getHeaders()
@@ -458,7 +493,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 
 			# Process results from parallel tests
 			for param, result in results:
-				xss_status, xss_score, xss_attack, xss_desc, sqli_status, sqli_score, sqli_attack, sqli_desc, ssti_status, ssti_score, ssti_attack, ssti_desc = result
+				xss_status, xss_score, xss_attack, xss_desc, sqli_status, sqli_score, sqli_attack, sqli_desc, ssti_status, ssti_score, ssti_attack, ssti_desc, xss_payload = result  # <-- NEW
 				
 				resultxss.append(xss_status)
 				resultsqli.append(sqli_status)
@@ -467,6 +502,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 				if xss_attack:
 					xssreqresp.append(xss_attack)
 					xss_description.append(xss_desc)
+					xss_payloads.append(xss_payload)  # <-- NEW
 					xssflag = self.checkBetterScore(xss_score, xssflag)
 				
 				if sqli_attack:
@@ -520,7 +556,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			else:
 				final_SSTI = "Disabled"
 
-			self.addToLog(messageInfo, final_XSS, final_SQLi, final_SSTI, param_new, resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp , xss_description, sqli_description, ssti_description, req_time.strftime('%H:%M:%S %m/%d/%y'))
+			self.addToLog(messageInfo, final_XSS, final_SQLi, final_SSTI, param_new, resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp , xss_description, sqli_description, ssti_description, req_time.strftime('%H:%M:%S %m/%d/%y'), xss_payloads)
 		finally:
 			self.semaphore.release()
 	
@@ -544,11 +580,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		Phase 3: Generate and test targeted payloads based on reflected chars and context.
 		"""
 		# ---------- Phase 1: Probe for raw character reflection ----------
-		# Use a neutral marker (no special chars) to locate reflection position for context.
 		probe_start = "PROBE_START"
 		probe_end = "PROBE_END"
-		# Markers for special characters (each contains a unique substring and the actual char)
-		# Format: "KEY_char" where char is the actual special character.
 		marker_defs = [
 			("LT", "<"), ("GT", ">"), ("QUOT", "\""), ("SING", "'"),
 			("SLASH", "/"), ("BSLASH", "\\"), ("BACKTICK", "`"),
@@ -556,57 +589,49 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			("PAREN_C", ")"), ("EQ", "="), ("ALERT", "alert"),
 			("ONERROR", "onerror"), ("SCRIPT", "script")
 		]
-		# Build probe payload: neutral start + all markers + neutral end
 		probe_payload = probe_start
 		for key, char in marker_defs:
 			probe_payload += "XSS_" + key + "_" + char
 		probe_payload += probe_end
 
-		updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, probe_payload)
+		updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, probe_payload, encode=True)
 		if updated_request is None:
-			return (self.NOT_FOUND, 0, None, "")
+			return (self.NOT_FOUND, 0, None, "", "")
 
 		probe_response = self.makeRequest(original_message, updated_request)
 		if probe_response is None:
-			return (self.NOT_FOUND, 0, None, "")
+			return (self.NOT_FOUND, 0, None, "", "")
 
 		response_bytes = probe_response.getResponse()
 		if response_bytes is None:
-			return (self.NOT_FOUND, 0, None, "")
+			return (self.NOT_FOUND, 0, None, "", "")
 		response_str = self._helpers.bytesToString(response_bytes)
+		decoded_response = self._helpers.urlDecode(response_str)
 
-		# Find neutral marker positions (use start for context detection)
-		start_pos = response_str.find(probe_start)
+		start_pos = decoded_response.find(probe_start)
 		if start_pos == -1:
-			return (self.NOT_FOUND, 0, None, "")
+			return (self.NOT_FOUND, 0, None, "", "")
 
-		# Determine which special characters are reflected raw (the marker string itself appears)
 		reflected_chars = set()
 		for key, char in marker_defs:
 			marker = "XSS_" + key + "_" + char
-			if marker in response_str:
+			if marker in decoded_response:
 				reflected_chars.add(char)
 
-		# Early exit: if no critical raw chars are reflected, XSS is highly unlikely
 		if not reflected_chars:
-			return (self.NOT_FOUND, 0, None, "")
+			return (self.NOT_FOUND, 0, None, "", "")
 
-		# ---------- Phase 2: Detect context using the neutral marker position ----------
-		context_info = self._detect_context(response_str, start_pos)
-
-		# ---------- Phase 3: Generate and test targeted payloads ----------
+		context_info = self._detect_context(decoded_response, start_pos)
 		payloads = self._generate_xss_payloads(context_info, reflected_chars)
 
 		best_score = 0
 		best_status = self.NOT_FOUND
 		best_attack = None
 		best_desc = ""
+		best_payload = ""  # <-- NEW: store the actual payload
 
-		# Test each generated payload
 		for idx, payload_template in enumerate(payloads):
-			# Add a unique marker to verify raw reflection for this specific payload
 			unique_marker = "XSS_MARKER_%d_" % idx
-			# Construct the final payload: marker + template (with context placeholders filled)
 			final_payload = payload_template.format(
 				marker=unique_marker,
 				tag=context_info.get('tag_name', 'div'),
@@ -614,7 +639,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			)
 
 			updated_request = self._buildUpdatedRequest(
-				request, headers, param_name, param_value, param_type, final_payload
+				request, headers, param_name, param_value, param_type, final_payload, encode=True
 			)
 			if updated_request is None:
 				continue
@@ -627,30 +652,27 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			if attack_response is None:
 				continue
 			attack_response_str = self._helpers.bytesToString(attack_response)
+			decoded_attack = self._helpers.urlDecode(attack_response_str)
 
-			# Check if our unique marker is reflected raw
-			if unique_marker in attack_response_str:
-				# Raw reflection of the marker indicates the payload structure worked
+			if unique_marker in decoded_attack:
 				score_increment = 2
 				desc = "Payload <b>%s</b> reflected successfully with marker <b>%s</b>." % (
 					self._helpers.urlDecode(final_payload.replace(unique_marker, "")),
 					unique_marker
 				)
-				# Bonus if this is a sensitive context
 				if context_info['context'] in ['QUOTED_ATTR', 'UNQUOTED_ATTR', 'SCRIPT_BLOCK']:
 					score_increment += 1
-				if "alert" in final_payload and "alert" in attack_response_str:
-					score_increment += 1  # Strong evidence
+				if "alert" in final_payload and "alert" in decoded_attack:
+					score_increment += 1
 
 				best_score += score_increment
 				if score_increment >= 2 and best_attack is None:
 					best_attack = attack
 					best_desc = desc
+					best_payload = final_payload  # <-- NEW: store the successful payload
 			else:
-				# Marker not reflected raw, maybe it was encoded or filtered
 				continue
 
-		# Determine final status based on best_score
 		if best_score >= 4:
 			best_status = self.FOUND
 		elif best_score >= 2:
@@ -659,10 +681,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			best_status = self.NOT_FOUND
 
 		if best_attack is None:
-			# If no payload worked but we had raw chars, at least return the probe response
-			return (best_status, best_score, probe_response, "Raw chars reflected but no specific payload succeeded. Manual check advised.")
-		
-		return (best_status, best_score, best_attack, best_desc)
+			return (best_status, best_score, probe_response, "Raw chars reflected but no specific payload succeeded. Manual check advised.", "")
+
+		return (best_status, best_score, best_attack, best_desc, best_payload)  # <-- NEW: return best_payload
 
 	def _detect_context(self, response_str, position):
 		"""
@@ -992,8 +1013,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		payloads = [
 			"{{7*7}}",		 # Jinja2 / Twig
 			"${7*7}",		 # JSP / Java / Freemarker
-			"<%= 7*7 %>",    # ERB / Ruby
-			"#{7*7}"         # Ruby (alternative)
+			"<%= 7*7 %>",	 # ERB / Ruby
+			"#{7*7}"		 # Ruby (alternative)
 		]
 		
 		best_status = self.NOT_FOUND
@@ -1055,15 +1076,16 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		xss_desc = ""
 		sqli_desc = ""
 		ssti_desc = ""
+		xss_payload = ""
 
 		if xss_enabled:
-			xss_status, xss_score, xss_attack, xss_desc = self._test_xss(request, headers, name, param_value, ptype, original_message)
+			xss_status, xss_score, xss_attack, xss_desc, xss_payload = self._test_xss(request, headers, name, param_value, ptype, original_message)
 		if sqli_enabled:
 			sqli_status, sqli_score, sqli_attack, sqli_desc = self._test_sqli(request, headers, name, param_value, ptype, original_message, baseline_time)
 		if ssti_enabled:
 			ssti_status, ssti_score, ssti_attack, ssti_desc = self._test_ssti(request, headers, name, param_value, ptype, original_message)
 
-		return (xss_status, xss_score, xss_attack, xss_desc, sqli_status, sqli_score, sqli_attack, sqli_desc, ssti_status, ssti_score, ssti_attack, ssti_desc)
+		return (xss_status, xss_score, xss_attack, xss_desc, sqli_status, sqli_score, sqli_attack, sqli_desc, ssti_status, ssti_score, ssti_attack, ssti_desc, xss_payload)
 
 	def makeRequest(self, messageInfo, message):
 		try:
@@ -1075,12 +1097,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 			print("[ReTrishul] Request error for %s: %s" % (messageInfo.getUrl(), str(e)))
 			return None
 
-	def addToLog(self, messageInfo, final_XSS, final_SQLi, final_SSTI, parameters, resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp, xss_description, sqli_description, ssti_description, req_time):
+	def addToLog(self, messageInfo, final_XSS, final_SQLi, final_SSTI, parameters, resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp, xss_description, sqli_description, ssti_description, req_time, xss_payloads):
 		requestInfo = self._helpers.analyzeRequest(messageInfo)
 		method = requestInfo.getMethod()
 		self._lock.acquire()
 		row = self._log.size()
-		self._log.add(LogEntry(self._callbacks.saveBuffersToTempFiles(messageInfo), requestInfo.getUrl(),method,final_XSS,final_SQLi,final_SSTI,req_time, parameters,resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp, xss_description, sqli_description, ssti_description)) # same requests not include again.
+		self._log.add(LogEntry(self._callbacks.saveBuffersToTempFiles(messageInfo), requestInfo.getUrl(),method,final_XSS,final_SQLi,final_SSTI,req_time, parameters,resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp, xss_description, sqli_description, ssti_description, xss_payloads))
 		SwingUtilities.invokeLater(UpdateTableEDT(self,"insert",row,row))
 		self._lock.release()
 
@@ -1099,11 +1121,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		return params
 
 class DividerRunnable(Runnable):
-    def __init__(self, extender):
-        self.extender = extender
+	def __init__(self, extender):
+		self.extender = extender
 
-    def run(self):
-        self.extender._adjustDivider()
+	def run(self):
+		self.extender._adjustDivider()
 
 # Extend JTable to handle cell selection
 class Table(JTable):
@@ -1227,8 +1249,7 @@ class Table(JTable):
 
 # Log to Store Data of Requests
 class LogEntry:
-
-	def __init__(self, requestResponse, url, method, final_XSS, final_SQLi, final_SSTI, req_time, parameter, resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp, xss_description, sqli_description, ssti_description):
+	def __init__(self, requestResponse, url, method, final_XSS, final_SQLi, final_SSTI, req_time, parameter, resultxss, resultsqli, resultssti, xssreqresp, sqlireqresp, sstireqresp, xss_description, sqli_description, ssti_description, xss_payloads):
 		self._requestResponse = requestResponse
 		self._url = url
 		self._method = method
@@ -1246,6 +1267,7 @@ class LogEntry:
 		self._ssti_description = ssti_description
 		self._xss_description = xss_description
 		self._sqli_description = sqli_description
+		self._xss_payloads = xss_payloads  # <-- NEW
 		return
 
 # Mouse Adapter to click on Table and Tree to display data
@@ -1318,6 +1340,18 @@ class mouseclick(MouseAdapter):
 						self._extender._currentlyDisplayedItem = xssreqresp[i]
 						self._extender._texteditor.setText(xssreqresp[i].getResponse())
 						self._extender._texteditor.setSearchExpression("testtest")
+						self._extender.payloadEditor.setText("")
+						if i < len(logEntry._xss_payloads):
+							payload = logEntry._xss_payloads[i]
+							if payload:
+								self._extender.payloadEditor.setText(payload)
+								self._extender.copyButton.setEnabled(True)
+							else:
+								self._extender.payloadEditor.setText("No specific payload found.")
+								self._extender.copyButton.setEnabled(False)
+						else:
+							self._extender.payloadEditor.setText("No payload available.")
+							self._extender.copyButton.setEnabled(False)
 				elif str(self.path.getParent()) == "SQL Injection":
 					if str(self.path) == parameter[i].getName():
 						self._extender.textfield.setText("")
