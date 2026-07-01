@@ -440,11 +440,45 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 
 		results = [r for r in param_results if r is not None]
 
+		# Process results from parallel tests
+		for param, result in results:
+			xss_status, xss_score, xss_attack, xss_desc, sqli_status, sqli_score, sqli_attack, sqli_desc, ssti_status, ssti_score, ssti_attack, ssti_desc = result
+			
+			resultxss.append(xss_status)
+			resultsqli.append(sqli_status)
+			resultssti.append(ssti_status)
+			
+			if xss_attack:
+				xssreqresp.append(xss_attack)
+				xss_description.append(xss_desc)
+				xssflag = self.checkBetterScore(xss_score, xssflag)
+			
+			if sqli_attack:
+				sqlireqresp.append(sqli_attack)
+				sqli_description.append(sqli_desc)
+				sqliflag = self.checkBetterScore(sqli_score, sqliflag)
+			
+			if ssti_attack:
+				sstireqresp.append(ssti_attack)
+				ssti_description.append(ssti_desc)
+				sstiflag = self.checkBetterScore(ssti_score, sstiflag)
+
 		if self.xsscheck.isSelected():
-			if xssflag >= 2:
+			html_xss_found = False
+			for i, status in enumerate(resultxss):
+				if (status == self.FOUND or status == self.CHECK) and xssreqresp[i] is not None:
+					resp = xssreqresp[i].getResponse()
+					if resp:
+						content = self._helpers.analyzeResponse(resp)
+						mime = content.getStatedMimeType().lower()
+						if "html" in mime or "text/html" in str(content.getHeaders()):
+							html_xss_found = True
+							break
+			
+			if html_xss_found and xssflag >= 2:
 				final_XSS = self.FOUND
 			elif xssflag >= 1:
-				final_XSS = self.CHECK
+				final_XSS = self.CHECK   # CHECK for both HTML tentative and non-HTML reflection
 			else:
 				final_XSS = self.NOT_FOUND
 		else:
@@ -485,15 +519,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		return port
 		
 	def _test_xss(self, request, headers, param_name, param_value, param_type, original_message):
-		payload_array = ["<", ">", "\\\\'asd", "\\\\\"asd", "\\", "'\""]
-		json_payload_array = ["<", ">", "\\\\'asd", "\\\"asd", "\\", "\'\\\""]
-		rand_str = "testtest"
-		payload_all = ""
-		json_payload = ""
-		for payload in payload_array:
-			payload_all += rand_str + payload
-		for payload in json_payload_array:
-			json_payload += rand_str + payload
+		"""Improved XSS detection - No FOUND for non-HTML responses"""
+		payload_array = ["<", ">", "'", "\"", "\\", "`", "{", "}", "/*", "*/", "alert(1)", "onerror=alert(1)"]
+		json_payload_array = ["<", ">", "'", "\"", "\\", "`", "{", "}", "alert(1)"]
+		
+		rand_str = "xss_test_"
+		payload_all = rand_str + "".join(payload_array)
+		json_payload = rand_str + "".join(json_payload_array)
 
 		if param_type in (0, 1):
 			updated_request = self._buildUpdatedRequest(request, headers, param_name, param_value, param_type, payload_all)
@@ -505,23 +537,38 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 		attack = self.makeRequest(original_message, updated_request)
 		if attack is None:
 			return (self.NOT_FOUND, 0, None, "")
-		response_str = self._helpers.bytesToString(attack.getResponse())
+
+		response = attack.getResponse()
+		response_str = self._helpers.bytesToString(response)
+		
+		# Check if response is HTML
+		content_resp = self._helpers.analyzeResponse(response)
+		mime_type = content_resp.getStatedMimeType().lower()
+		is_html = "html" in mime_type or "text/html" in str(content_resp.getHeaders())
+
 		score = 0
-		non_encoded = ""
-		for check_payload in payload_array:
-			if_found = rand_str + check_payload
-			if if_found in response_str:
-				non_encoded += "<br>" + check_payload.replace('<', '&lt;')
+		reflected = []
+
+		for p in payload_array:
+			if rand_str + p in response_str or p in response_str:
+				reflected.append(p.replace('<', '&lt;'))
 				score += 1
-		if score >= 2:
+
+		# Strict rule: Non-HTML responses never get FOUND
+		if score >= 3 and is_html:
 			status = self.FOUND
-		elif score >= 1:
-			status = self.CHECK
+		elif score >= 2:
+			status = self.CHECK   # CHECK for both HTML and non-HTML reflection
 		else:
 			status = self.NOT_FOUND
+
 		description = ""
-		if non_encoded:
-			description = "The Payload <b>" + payload_all.replace('<', '&lt;') + "</b> was passed in the request for the paramater <b>" + self._helpers.urlDecode(param_name) + "</b>. Some Tags were observed in the output unfiltered. A payload can be generated with the observed tags.<br>Symbols not encoded for parameter <b>" + param_name + "</b>: " + non_encoded
+		if reflected:
+			if is_html:
+				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Reflected characters: " + ", ".join(reflected) + "<br>Parameter <b>" + self._helpers.urlDecode(param_name) + "</b> appears vulnerable to Reflected XSS."
+			else:
+				description = "The payload <b>" + payload_all.replace('<', '&lt;') + "</b> was sent.<br>Reflected characters: " + ", ".join(reflected) + "<br>Response Content-Type is <b>" + mime_type + "</b>. Reflection found but likely not exploitable XSS (API)."
+
 		return (status, score, attack, description)
 		
 	def _test_sqli(self, request, headers, param_name, param_value, param_type, original_message, baseline_time):
@@ -782,35 +829,25 @@ class Table(JTable):
 		root = model.getRoot()
 		root.removeAllChildren()
 		model.reload()
+		
 		self.xssroot = DefaultMutableTreeNode('Cross-Site-Scripting')
 		root.add(self.xssroot)
 		self.sqliroot = DefaultMutableTreeNode('SQL Injection')
 		root.add(self.sqliroot)
 		self.sstiroot = DefaultMutableTreeNode('Server Side Template Injection')
 		root.add(self.sstiroot)
-		resultxss = []
-		resultsqli = []
-		resultssti = []
+		
 		logEntry = self._extender._log.get(self._extender.logTable.convertRowIndexToModel(row))
-		resultxss = logEntry._resultxss
-		resultsqli = logEntry._resultsqli
-		resultssti = logEntry._resultssti
 		parameter = logEntry._parameter
+		resultxss = logEntry._resultxss
 		
 		for i in range(len(parameter)):
-			if resultxss[i] == self._extender.CHECK or resultxss[i] == self._extender.FOUND:
-				array = []
-				array.append(parameter[i].getName())
-				self._extender.addIssues(self.xssroot, array)
-			if resultsqli[i] == self._extender.CHECK or resultsqli[i] == self._extender.FOUND:
-				array = []
-				array.append(parameter[i].getName())
-				self._extender.addIssues(self.sqliroot, array)
-			if resultssti[i] == self._extender.CHECK or resultssti[i] == self._extender.FOUND:
-				array = []
-				array.append(parameter[i].getName())
-				self._extender.addIssues(self.sstiroot, array)
+			status = resultxss[i] if i < len(resultxss) else "NO_STATUS"
+			if status == self._extender.CHECK or status == self._extender.FOUND:
+				self._extender.addIssues(self.xssroot, [parameter[i].getName()])
+		
 		self._extender.rowSelected = row
+		self._extender.tree.expandRow(0)
 		return
 
 # Log to Store Data of Requests
@@ -885,10 +922,12 @@ class mouseclick(MouseAdapter):
 						self._extender.textfield.setText("")
 						response = xssreqresp[i].getResponse()
 						content_resp = self._extender._helpers.analyzeResponse(response)
-						if content_resp.getStatedMimeType() == "HTML":
+						mime = content_resp.getStatedMimeType().lower()
+						if "html" in mime or "text/html" in str(content_resp.getHeaders()):
 							confidence = self.checkConfidence(logEntry._resultxss[i])
 						else:
-							confidence = "<b style=\"color: orange;\">Tentative (Non HTML Output)</b>"
+							confidence = "<b style=\"color: orange;\">Tentative (Non-HTML / API Response)</b>"
+
 						self._extender.kit.insertHTML(self._extender.doc, self._extender.doc.getLength(), "<h1>"+str(self.path.getParent())+"</h1>", 0, 0, None)
 						self._extender.kit.insertHTML(self._extender.doc, self._extender.doc.getLength(), "<br><table cellspacing=\"1\" cellpadding=\"0\"><tr><td>Issue:</td> <td><b>" + str(self.path.getParent()) + "</b></td></tr><tr><td>Severity:</td> <td><b>High</b></td></tr><tr><td>Confidence:</td> <td>" + confidence + "</b></td></tr><tr><td>URL:</td> <td><b>" + url + "</b></td></tr>" , 0, 0, None)
 						self._extender.kit.insertHTML(self._extender.doc, self._extender.doc.getLength(), "<br><h3>Description</h3>", 0, 0, None)
